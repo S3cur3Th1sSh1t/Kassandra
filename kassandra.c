@@ -52,15 +52,12 @@
 #define LEVEL_LOW      2
 #define LEVEL_MEDIUM   3
 #define LEVEL_HIGH     4
-#define LEVEL_CRITICAL 5
-
 /* ── Console colors (Windows console attributes) ───────────────────── */
 #define COLOR_DEFAULT  0x07
 #define COLOR_INFO     0x08  /* dark gray */
 #define COLOR_LOW      0x0A  /* green     */
 #define COLOR_MEDIUM   0x0E  /* yellow    */
 #define COLOR_HIGH     0x0C  /* red       */
-#define COLOR_CRITICAL 0x0D  /* magenta   */
 #define COLOR_BANNER   0x0B  /* cyan      */
 
 /* ── FNV-1a 64-bit constants ───────────────────────────────────────── */
@@ -338,6 +335,12 @@ typedef struct module_entry {
     struct module_entry *next;
 } module_entry_t;
 
+/* ── Dynamic allocation record (pages touched by dynamic code) ──────── */
+typedef struct dynalloc_entry {
+    ULONG64 page_base;
+    struct dynalloc_entry *next;
+} dynalloc_entry_t;
+
 /* ── Service port tracking (unique ports per process) ──────────────── */
 typedef struct port_entry {
     USHORT port;
@@ -355,6 +358,7 @@ typedef struct process_record {
     port_entry_t *service_ports;
     int service_port_count;
     ULONG balloon_mask;   /* bitmask of loaded security DLLs (28 bits) */
+    dynalloc_entry_t *dynallocs;  /* pages allocated/touched by dynamic code */
     struct process_record *next;
 } process_record_t;
 
@@ -383,6 +387,74 @@ static volatile LONGLONG g_pf_count    = 0;
 static volatile LONGLONG g_proc_count  = 0;
 static volatile LONGLONG g_event_id_seq = 0;
 
+/* ── PageFault timestamp cache ────────────────────────────────────────
+ * Maps (PID, EventTimeStamp) → (VirtualAddress, opcode) so that
+ * StackWalk events can be correlated back to their originating
+ * PageFault_TypeGroup1 event.
+ */
+#define PF_CACHE_SIZE  16384
+#define PF_CACHE_MASK  (PF_CACHE_SIZE - 1)
+
+typedef struct {
+    ULONG64 timestamp;
+    ULONG   pid;
+    ULONG64 virtual_address;
+    UCHAR   opcode;
+    UCHAR   used;
+} pf_cache_entry_t;
+
+static pf_cache_entry_t g_pf_cache[PF_CACHE_SIZE];
+
+static inline ULONG pf_cache_hash(ULONG pid, ULONG64 ts) {
+    ULONG64 h = ts ^ ((ULONG64)pid << 32) ^ ((ULONG64)pid);
+    h = (h ^ (h >> 16)) * 0x45d9f3bULL;
+    h = (h ^ (h >> 16));
+    return (ULONG)(h & PF_CACHE_MASK);
+}
+
+static void pf_cache_insert(ULONG pid, ULONG64 timestamp,
+                             ULONG64 vaddr, UCHAR opcode) {
+    ULONG idx = pf_cache_hash(pid, timestamp);
+    for (int i = 0; i < 4; i++) {
+        ULONG slot = (idx + i) & PF_CACHE_MASK;
+        if (!g_pf_cache[slot].used ||
+            (g_pf_cache[slot].pid == pid &&
+             g_pf_cache[slot].timestamp == timestamp)) {
+            g_pf_cache[slot].timestamp = timestamp;
+            g_pf_cache[slot].pid = pid;
+            g_pf_cache[slot].virtual_address = vaddr;
+            g_pf_cache[slot].opcode = opcode;
+            g_pf_cache[slot].used = 1;
+            return;
+        }
+    }
+    g_pf_cache[idx].timestamp = timestamp;
+    g_pf_cache[idx].pid = pid;
+    g_pf_cache[idx].virtual_address = vaddr;
+    g_pf_cache[idx].opcode = opcode;
+    g_pf_cache[idx].used = 1;
+}
+
+static pf_cache_entry_t *pf_cache_lookup(ULONG pid, ULONG64 timestamp) {
+    ULONG idx = pf_cache_hash(pid, timestamp);
+    for (int i = 0; i < 4; i++) {
+        ULONG slot = (idx + i) & PF_CACHE_MASK;
+        if (g_pf_cache[slot].used &&
+            g_pf_cache[slot].pid == pid &&
+            g_pf_cache[slot].timestamp == timestamp)
+            return &g_pf_cache[slot];
+        if (!g_pf_cache[slot].used) break;
+    }
+    return NULL;
+}
+
+/* ── Stack tracing configuration (for TraceSetInformation) ──────────── */
+typedef struct {
+    GUID  EventGuid;
+    UCHAR Type;
+    UCHAR Reserved[7];
+} STACK_EVENT_ID;
+
 static LARGE_INTEGER     g_start_time;
 static LARGE_INTEGER     g_perf_freq;
 static HANDLE            g_console;
@@ -406,6 +478,8 @@ static const GUID UdpIpGuid =
     {0xbf3a50c5, 0xa9c9, 0x4988, {0xa0,0x05,0x2d,0xf0,0xb7,0xc8,0x0f,0x80}};
 static const GUID PageFaultGuid =
     {0x3d6fa8d3, 0xfe05, 0x11d0, {0x9d,0xda,0x00,0xc0,0x4f,0xd7,0xba,0x7c}};
+static const GUID StackWalkGuid =
+    {0xdef2fe46, 0x7bd6, 0x4b80, {0xbd,0x94,0xf5,0x7f,0xe2,0x0d,0x0c,0xe3}};
 static const GUID SystemTraceControlGuid =
     {0x9e814aad, 0x3204, 0x11d2, {0x9a,0x82,0x00,0x60,0x08,0xa8,0x69,0x39}};
 
@@ -414,6 +488,9 @@ static const GUID SystemTraceControlGuid =
 static const GUID KernelProcessGuid =
     {0x22fb2cd6, 0x0e7b, 0x422b, {0xa0,0xc7,0x2f,0xad,0x1f,0xd0,0xe7,0x16}};
 /* Microsoft-Windows-TCPIP (user-mode): same as kernel TcpIp GUID */
+/* Microsoft-Windows-ThreadPool: {c861d0e2-a2c1-4d36-9f9c-970bab943a12} */
+static const GUID ThreadPoolGuid =
+    {0xc861d0e2, 0xa2c1, 0x4d36, {0x9f,0x9c,0x97,0x0b,0xab,0x94,0x3a,0x12}};
 
 /* ── Forward declarations ──────────────────────────────────────────── */
 static void WINAPI event_callback(PEVENT_RECORD pEvent);
@@ -427,6 +504,8 @@ static int  is_service_port(USHORT port);
 static void add_service_port(process_record_t *proc, USHORT port);
 static int  is_address_in_module(process_record_t *proc, ULONG64 addr);
 static void add_module(process_record_t *proc, ULONG64 base, ULONG64 size);
+static void add_dynalloc(process_record_t *proc, ULONG64 addr);
+static int  is_address_in_dynalloc(process_record_t *proc, ULONG64 addr);
 static int  compute_level(USHORT tags);
 static void build_tag_string(USHORT tags, char *buf, size_t bufsz);
 static void emit_alert(process_record_t *proc, int level);
@@ -514,6 +593,12 @@ static void free_process(process_record_t *proc) {
         free(pt);
         pt = next;
     }
+    dynalloc_entry_t *da = proc->dynallocs;
+    while (da) {
+        dynalloc_entry_t *next = da->next;
+        free(da);
+        da = next;
+    }
     free(proc);
 }
 
@@ -540,6 +625,31 @@ static int is_address_in_module(process_record_t *proc, ULONG64 addr) {
         if (addr >= m->base && addr < m->base + m->size)
             return 1;
         m = m->next;
+    }
+    return 0;
+}
+
+/* ── Dynamic allocation tracking (pages touched by dynamic code) ──── */
+static void add_dynalloc(process_record_t *proc, ULONG64 addr) {
+    ULONG64 page = addr & ~0xFFFULL;
+    dynalloc_entry_t *d = proc->dynallocs;
+    while (d) {
+        if (d->page_base == page) return;
+        d = d->next;
+    }
+    d = (dynalloc_entry_t *)malloc(sizeof(dynalloc_entry_t));
+    if (!d) return;
+    d->page_base = page;
+    d->next = proc->dynallocs;
+    proc->dynallocs = d;
+}
+
+static int is_address_in_dynalloc(process_record_t *proc, ULONG64 addr) {
+    ULONG64 page = addr & ~0xFFFULL;
+    dynalloc_entry_t *d = proc->dynallocs;
+    while (d) {
+        if (d->page_base == page) return 1;
+        d = d->next;
     }
     return 0;
 }
@@ -1058,71 +1168,147 @@ static void handle_tcpip_event(PEVENT_RECORD pEvent) {
     free(pInfo);
 }
 
-/* ── VirtualAlloc / Dynamic Code events ───────────────────────────────
+/* ── PageFault_TypeGroup1 events ──────────────────────────────────────
  *
- * The original binary uses StackWalk event correlation with VirtualAlloc
- * events from Microsoft-Windows-Kernel-Memory.  Without StackWalk, we
- * approximate by flagging VirtualAlloc (opcode 98) for non-system PIDs
- * where the allocated address is outside known modules.
+ * Cache DemandZeroFault (11), CopyOnWrite (12), TransitionFault (10)
+ * events keyed by (PID, EventTimeStamp).  StackWalk events that arrive
+ * shortly after use EventTimeStamp to correlate back to these.
  *
- * TAG_DYNAMIC_CODE_NESTED requires StackWalk correlation with Image/Load
- * events (detecting reflective DLL loading via call-stack analysis) and
- * cannot be accurately detected without it.
+ * Raw layout on x64: VirtualAddress(8) + ProgramCounter(8) = 16 bytes
  */
 static void handle_pagefault_event(PEVENT_RECORD pEvent) {
     InterlockedIncrement64(&g_pf_count);
 
     UCHAR opcode = pEvent->EventHeader.EventDescriptor.Opcode;
-    if (opcode != 98) return;  /* only VirtualAlloc, not page faults */
+
+    if (opcode != 10 && opcode != 11 && opcode != 12) return;
+
+    if (!pEvent->UserData || pEvent->UserDataLength < 16) return;
 
     ULONG pid = pEvent->EventHeader.ProcessId;
-    if (pid <= 4) return;  /* skip Idle (0) and System (4) */
+    if (pid <= 4) return;
 
-    PTRACE_EVENT_INFO pInfo = alloc_event_info(pEvent);
-    if (!pInfo) return;
+    ULONG64 vaddr = *(ULONG64 *)pEvent->UserData;
+    if (vaddr == 0 || vaddr >= 0xFFFF000000000000ULL) return;
 
-    ULONG64 va_addr = 0;
-    get_event_property_uint64(pEvent, pInfo, L"BaseAddress", &va_addr);
-    if (va_addr == 0)
-        get_event_property_uint64(pEvent, pInfo, L"VirtualAddress", &va_addr);
+    pf_cache_insert(pid, pEvent->EventHeader.TimeStamp.QuadPart,
+                    vaddr, opcode);
+}
 
-    /* Skip kernel-mode addresses */
-    if (va_addr == 0 || (va_addr & 0xFFFF000000000000ULL) == 0xFFFF000000000000ULL) {
-        free(pInfo);
+/* ── StackWalk events ─────────────────────────────────────────────────
+ *
+ * Correlated with PageFault_TypeGroup1 events via EventTimeStamp.
+ *
+ * For DemandZeroFault / CopyOnWrite (opcodes 11, 12):
+ *   - Broken callstack (frame outside any module) → TAG_DYNAMIC_CODE
+ *   - Record the faulted VirtualAddress in dynalloc map (these are
+ *     pages being written/allocated by dynamic code)
+ *
+ * For TransitionFault (opcode 10):
+ *   - If any callstack frame falls in the dynalloc map → code executing
+ *     from a page that dynamic code previously wrote to
+ *   - This is nested dynamic code → TAG_DYNAMIC_CODE_NESTED
+ *
+ * Raw layout: EventTimeStamp(8) + StackProcess(4) + StackThread(4)
+ *             + Stack[N] where each frame is pointer-sized (8 on x64)
+ */
+static void handle_stackwalk_event(PEVENT_RECORD pEvent) {
+    if (g_rundown_active) return;
+    if (!pEvent->UserData || pEvent->UserDataLength < 24) return;
+
+    BYTE *data = (BYTE *)pEvent->UserData;
+    ULONG64 eventTimestamp = *(ULONG64 *)data;
+    ULONG stackProcess = *(ULONG *)(data + 8);
+
+    if (stackProcess <= 4) return;
+
+    int frameBytes = (int)pEvent->UserDataLength - 16;
+    if (frameBytes <= 0) return;
+    int numFrames = frameBytes / sizeof(ULONG_PTR);
+    ULONG_PTR *frames = (ULONG_PTR *)(data + 16);
+
+    pf_cache_entry_t *cached = pf_cache_lookup(stackProcess, eventTimestamp);
+    if (!cached) return;
+
+    EnterCriticalSection(&g_proc_lock);
+    process_record_t *proc = find_process(stackProcess);
+    if (!proc || !proc->modules) {
+        LeaveCriticalSection(&g_proc_lock);
         return;
     }
 
-    ULONG64 region_size = 0;
-    get_event_property_uint64(pEvent, pInfo, L"RegionSize", &region_size);
-    if (region_size == 0) region_size = 0x1000;
-
-    EnterCriticalSection(&g_proc_lock);
-    process_record_t *proc = find_process(pid);
-    if (proc && proc->modules) {
-        if (!is_address_in_module(proc, va_addr)) {
+    if (cached->opcode == 11 || cached->opcode == 12) {
+        int has_dynamic_frame = 0;
+        for (int i = 0; i < numFrames; i++) {
+            ULONG64 frame = (ULONG64)frames[i];
+            if (frame == 0) continue;
+            if (frame >= 0xFFFF000000000000ULL) continue;
+            if (!is_address_in_module(proc, frame) &&
+                !is_address_in_system_dlls(frame)) {
+                has_dynamic_frame = 1;
+                break;
+            }
+        }
+        if (has_dynamic_frame) {
             try_tag(proc, TAG_DYNAMIC_CODE);
-            /* Register the allocated region so future lookups recognize it */
-            ULONG64 page_base = va_addr & ~0xFFFULL;
-            add_module(proc, page_base, region_size);
+            add_dynalloc(proc, cached->virtual_address);
+        }
+    } else if (cached->opcode == 10) {
+        for (int i = 0; i < numFrames; i++) {
+            ULONG64 frame = (ULONG64)frames[i];
+            if (frame == 0) continue;
+            if (frame >= 0xFFFF000000000000ULL) continue;
+            if (is_address_in_dynalloc(proc, frame)) {
+                try_tag(proc, TAG_DYNAMIC_CODE_NESTED);
+                break;
+            }
         }
     }
+
     LeaveCriticalSection(&g_proc_lock);
-    free(pInfo);
 }
 
-/* ── Thread events ────────────────────────────────────────────────────
+/* ── ThreadPool CBEnqueue events ──────────────────────────────────────
  *
- * Sleep/proxy TP callback detection is DISABLED here.  The original
- * binary only checks thread-pool work item events from a dedicated
- * provider, not general thread creation.  Checking all thread starts
- * causes massive false positives (RuntimeBroker, SearchHost, explorer
- * all have threads starting at WaitForSingleObject / Sleep).
- *
- * TODO: add Microsoft-Windows-ThreadPool provider and check its work
- * item callback addresses instead.
+ * Monitor TP_V2_CBEnqueue (opcode 34) from the ThreadPool provider.
+ * Resolve CallbackFunction against ntdll/kernel32/kernelbase exports
+ * to detect sleep-masking and module-proxying callbacks.
  */
-static void handle_thread_event(PEVENT_RECORD pEvent) {
+static void handle_threadpool_event(PEVENT_RECORD pEvent) {
     InterlockedIncrement64(&g_tp_count);
+
+    UCHAR opcode = pEvent->EventHeader.EventDescriptor.Opcode;
+    if (opcode != 34) return;
+
+    ULONG pid = pEvent->EventHeader.ProcessId;
+    if (pid <= 4) return;
+
+    ULONG64 callbackFunc = 0;
+
+    PTRACE_EVENT_INFO pInfo = alloc_event_info(pEvent);
+    if (pInfo) {
+        get_event_property_uint64(pEvent, pInfo, L"CallbackFunction",
+                                  &callbackFunc);
+        free(pInfo);
+    }
+
+    if (callbackFunc == 0 || callbackFunc >= 0xFFFF000000000000ULL)
+        return;
+
+    const char *funcName = resolve_address_in_system_dlls(callbackFunc);
+    if (!funcName) return;
+
+    ULONGLONG h = fnv1a_hash(funcName);
+
+    EnterCriticalSection(&g_proc_lock);
+    process_record_t *proc = get_or_create_process(pid);
+    if (proc) {
+        if (hash_set_contains(&g_sleep_hashes, h))
+            try_tag(proc, TAG_SLEEP_TP_CALLBACK);
+        else if (hash_set_contains(&g_proxy_hashes, h))
+            try_tag(proc, TAG_PROXY_TP_CALLBACK);
+    }
+    LeaveCriticalSection(&g_proc_lock);
 }
 
 /* ── Main kernel event dispatch ────────────────────────────────────── */
@@ -1141,8 +1327,8 @@ static void WINAPI event_callback(PEVENT_RECORD pEvent) {
         handle_tcpip_event(pEvent);
     else if (IsEqualGUID(provider, &PageFaultGuid))
         handle_pagefault_event(pEvent);
-    else if (IsEqualGUID(provider, &ThreadGuid))
-        handle_thread_event(pEvent);
+    else if (IsEqualGUID(provider, &StackWalkGuid))
+        handle_stackwalk_event(pEvent);
 }
 
 /* ── User-mode event dispatch (thread pool + kernel-process events) ── */
@@ -1150,17 +1336,13 @@ static void WINAPI user_event_callback(PEVENT_RECORD pEvent) {
     if (!pEvent || !g_running) return;
     InterlockedIncrement64(&g_event_count);
 
-    /* Thread pool work item events provide callback addresses we can
-     * resolve against system DLL exports to detect sleep/proxy abuse.
-     * We check for thread pool work item start events. */
     if (IsEqualGUID(&pEvent->EventHeader.ProviderId, &KernelProcessGuid)) {
-        /* Microsoft-Windows-Kernel-Process events can supplement
-         * classic kernel process events with richer data. */
         handle_process_event(pEvent);
-    }
-    /* TCP/IP user-mode events */
-    if (IsEqualGUID(&pEvent->EventHeader.ProviderId, &TcpIpGuid)) {
+    } else if (IsEqualGUID(&pEvent->EventHeader.ProviderId, &TcpIpGuid)) {
         handle_tcpip_event(pEvent);
+    } else if (IsEqualGUID(&pEvent->EventHeader.ProviderId,
+                            &ThreadPoolGuid)) {
+        handle_threadpool_event(pEvent);
     }
 }
 
@@ -1255,7 +1437,7 @@ static int start_kernel_trace(void) {
                           EVENT_TRACE_FLAG_THREAD |
                           EVENT_TRACE_FLAG_IMAGE_LOAD |
                           EVENT_TRACE_FLAG_NETWORK_TCPIP |
-                          EVENT_TRACE_FLAG_VIRTUAL_ALLOC;
+                          EVENT_TRACE_FLAG_MEMORY_PAGE_FAULTS;
 
     ULONG status = StartTraceW(&g_kernel_session_handle, KERNEL_SESSION, pProps);
     if (status != ERROR_SUCCESS) {
@@ -1268,6 +1450,24 @@ static int start_kernel_trace(void) {
         return -1;
     }
     free(pProps);
+
+    /* Enable stack collection for PageFault events we correlate with */
+    STACK_EVENT_ID stackIds[3];
+    memset(stackIds, 0, sizeof(stackIds));
+    stackIds[0].EventGuid = PageFaultGuid;
+    stackIds[0].Type = 10;  /* TransitionFault */
+    stackIds[1].EventGuid = PageFaultGuid;
+    stackIds[1].Type = 11;  /* DemandZeroFault */
+    stackIds[2].EventGuid = PageFaultGuid;
+    stackIds[2].Type = 12;  /* CopyOnWrite */
+
+    status = TraceSetInformation(g_kernel_session_handle,
+                                 (TRACE_INFO_CLASS)3,
+                                 stackIds, sizeof(stackIds));
+    if (status != ERROR_SUCCESS) {
+        fprintf(stderr, "Warning: TraceSetInformation (stack tracing) "
+                "failed: %lu\n", status);
+    }
 
     EVENT_TRACE_LOGFILEW logFile;
     ZeroMemory(&logFile, sizeof(logFile));
@@ -1329,6 +1529,16 @@ static int start_user_trace(void) {
                             0x10000, 0, 0, NULL);
     if (status != ERROR_SUCCESS) {
         /* Non-fatal: kernel TcpIp events will still work */
+    }
+
+    /* Enable Microsoft-Windows-ThreadPool provider for CB enqueue events */
+    status = EnableTraceEx2(g_user_session_handle, &ThreadPoolGuid,
+                            EVENT_CONTROL_CODE_ENABLE_PROVIDER,
+                            TRACE_LEVEL_VERBOSE,
+                            0, 0, 0, NULL);
+    if (status != ERROR_SUCCESS) {
+        fprintf(stderr, "Warning: EnableTraceEx2 (ThreadPool) failed: %lu\n",
+                status);
     }
 
     EVENT_TRACE_LOGFILEW logFile;
